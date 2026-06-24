@@ -32,30 +32,32 @@ class TelemetryWorker(QThread):
         self.running = True      # Booléen pour contrôler l'arrêt propre de la boucle
 
     def run(self):
-        """Le code dans cette méthode s'exécute automatiquement en arrière-plan."""
         while self.running:
-            # ÉTAPE B : Tentative de connexion / vérification de session active sur iRacing
             if self.ir.startup():
-                # On fige le buffer de variables actuel pour s'assurer que toutes les données
-                # de cette frame (vitesse, rpm, etc.) soient synchronisées au même instant exact.
                 self.ir.freeze_var_buffer_latest()
 
-                # Récupération de la vitesse. iRacing l'envoie nativement en mètres par seconde (m/s).
-                speed_mps = self.ir["Speed"]
+                # --- AJOUT DES VÉRIFICATIONS DE TOUR EFFECTIF ---
+                # 1. On vérifie le numéro du tour actuel (0 ou moins = pas dans un vrai tour)
+                current_lap = self.ir["Lap"]
 
-                # Conversion des m/s en km/h (Formule : m/s * 3.6)
-                speed_kmh = speed_mps * 3.6
+                # 2. Optionnel : On vérifie si la voiture est bien sur la piste (pas au stand/menu)
+                is_on_track = self.ir["IsOnTrack"]
 
-                # ÉTAPE C : Émission du signal.
-                # On "propulse" la vitesse calculée vers l'interface graphique.
-                self.speed_signal.emit(speed_kmh)
+                # CONDITION : Si on est en piste ET que le premier tour a commencé
+                if is_on_track and current_lap > 0:
+                    # On récupère et convertit la vitesse normalement
+                    speed_mps = self.ir["Speed"]
+                    speed_kmh = speed_mps * 3.6
+
+                    # On envoie la vitesse pour mettre à jour le graphique
+                    self.speed_signal.emit(speed_kmh)
+                else:
+                    # Si on n'est pas dans un tour valide, on envoie 0 (ou rien du tout)
+                    # pour figer/remettre à zéro le graphique pendant qu'on attend.
+                    self.speed_signal.emit(0.0)
             else:
-                # Si iRacing n'est pas démarré ou qu'on est au menu, on envoie 0.0 pour ne pas laisser le graph vide
                 self.speed_signal.emit(0.0)
 
-            # ÉTAPE D : Temporisation.
-            # La télémétrie en direct d'iRacing est rafraîchie à 60Hz.
-            # On dort donc pendant 1/60ème de seconde pour calquer notre rythme sur le jeu.
             time.sleep(1 / 60)
 
     def stop(self):
