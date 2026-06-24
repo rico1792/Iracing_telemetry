@@ -3,7 +3,7 @@ import time
 import irsdk
 import pandas as pd
 
-from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QFileDialog
+from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QFileDialog, QRadioButton
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -82,6 +82,8 @@ class TelemetryWorker(QThread):
                     throttle = self.ir["Throttle"] * 100.0
                     brake = self.ir["Brake"] * 100.0
                     gear = self.ir["Gear"]
+                    _ld = self.ir["LapDist"]
+                    lap_dist = float(_ld) if _ld is not None else 0.0
 
                     self.telemetry_signal.emit({
                         "lap_num": current_lap,
@@ -90,6 +92,7 @@ class TelemetryWorker(QThread):
                         "throttle": throttle,
                         "brake": brake,
                         "gear": gear,
+                        "lap_dist": lap_dist,
                         "in_outlap": self.in_outlap,
                         "is_in_pit": is_in_pit,
                         "is_in_garage": is_in_garage,
@@ -101,13 +104,13 @@ class TelemetryWorker(QThread):
                     self.in_outlap = True
                     self.telemetry_signal.emit({
                         "lap_num": 0, "lap_time": 0.0, "speed": 0.0, "throttle": 0.0, "brake": 0.0, "gear": 0,
-                        "in_outlap": True, "is_in_pit": is_in_pit, "is_in_garage": True,
+                        "lap_dist": 0.0, "in_outlap": True, "is_in_pit": is_in_pit, "is_in_garage": True,
                         "track_name": track_name, "car_name": car_name
                     })
             else:
                 self.telemetry_signal.emit({
                     "lap_num": 0, "lap_time": 0.0, "speed": 0.0, "throttle": 0.0, "brake": 0.0, "gear": 0,
-                    "in_outlap": True, "is_in_pit": False, "is_in_garage": True,
+                    "lap_dist": 0.0, "in_outlap": True, "is_in_pit": False, "is_in_garage": True,
                     "track_name": "Circuit", "car_name": "Voiture"
                 })
 
@@ -133,6 +136,8 @@ class MainWindow(QMainWindow):
         self.throttle_data = []
         self.brake_data = []
         self.gear_data = []
+        self.dist_data = []
+        self.x_axis_mode = "time"
         self.current_lap_buffer = []
 
         self.live_saved_laps = {}
@@ -171,6 +176,20 @@ class MainWindow(QMainWindow):
         self.btn_import.clicked.connect(self.import_laps_from_excel)
         btn_layout.addWidget(self.btn_export)
         btn_layout.addWidget(self.btn_import)
+
+        xaxis_label = QLabel("Axe X :")
+        xaxis_label.setStyleSheet(
+            "font-size: 11px; font-weight: bold; margin-top: 6px;")
+        btn_layout.addWidget(xaxis_label)
+        xaxis_row = QHBoxLayout()
+        self.radio_time = QRadioButton("Temps (s)")
+        self.radio_dist = QRadioButton("Distance (m)")
+        self.radio_time.setChecked(True)
+        self.radio_time.toggled.connect(self.on_xaxis_changed)
+        self.radio_dist.toggled.connect(self.on_xaxis_changed)
+        xaxis_row.addWidget(self.radio_time)
+        xaxis_row.addWidget(self.radio_dist)
+        btn_layout.addLayout(xaxis_row)
         btn_layout.addStretch()
 
         ctrl_layout.addLayout(btn_layout)
@@ -225,6 +244,7 @@ class MainWindow(QMainWindow):
         is_in_pit = data["is_in_pit"]
         is_in_garage = data["is_in_garage"]
 
+        lap_dist = data.get("lap_dist", 0.0)
         self.current_track = data["track_name"]
         self.current_car = data["car_name"]
         self.label_info.setText(
@@ -253,6 +273,7 @@ class MainWindow(QMainWindow):
             self.throttle_data.clear()
             self.brake_data.clear()
             self.gear_data.clear()
+            self.dist_data.clear()
             self.current_lap_buffer.clear()
             self.last_processed_lap = lap_num
 
@@ -267,21 +288,23 @@ class MainWindow(QMainWindow):
             self.throttle_data.append(throttle)
             self.brake_data.append(brake)
             self.gear_data.append(gear)
+            self.dist_data.append(lap_dist)
 
             self.current_lap_buffer.append(
-                (lap_time, speed, throttle, brake, gear))
+                (lap_time, speed, throttle, brake, gear, lap_dist))
 
+            x_data = self.get_x_data()
             self.line_speed.set_visible(True)
-            self.line_speed.set_data(self.time_data, self.speed_data)
+            self.line_speed.set_data(x_data, self.speed_data)
 
             self.line_throttle.set_visible(True)
-            self.line_throttle.set_data(self.time_data, self.throttle_data)
+            self.line_throttle.set_data(x_data, self.throttle_data)
 
             self.line_brake.set_visible(True)
-            self.line_brake.set_data(self.time_data, self.brake_data)
+            self.line_brake.set_data(x_data, self.brake_data)
 
             self.line_gear.set_visible(True)
-            self.line_gear.set_data(self.time_data, self.gear_data)
+            self.line_gear.set_data(x_data, self.gear_data)
         else:
             if in_outlap or is_in_pit or is_in_garage:
                 self.line_speed.set_visible(False)
@@ -290,7 +313,8 @@ class MainWindow(QMainWindow):
                 self.line_gear.set_visible(False)
 
         if not self.saved_view_active and self.time_data:
-            self.ax_gear.set_xlim(0, max(10, self.time_data[-1] + 1))
+            live_x = self.get_x_data()
+            self.ax_gear.set_xlim(0, max(10, live_x[-1] + 1))
 
         self.canvas.draw_idle()
 
@@ -344,7 +368,10 @@ class MainWindow(QMainWindow):
                 # CORRECTION ICI : On vérifie la taille du premier élément de 'pts'
                 has_extended_telemetry = len(pts[0]) > 2
 
-                xs = [p[0] for p in pts]
+                if self.x_axis_mode == "distance" and len(pts[0]) >= 6:
+                    xs = [p[5] for p in pts]
+                else:
+                    xs = [p[0] for p in pts]
                 ys_speed = [p[1] for p in pts]
 
                 # Utilisation de la condition corrigée
@@ -374,11 +401,15 @@ class MainWindow(QMainWindow):
                 self.saved_lap_lines[f"{origin}_{k}"] = [
                     ln_sp, ln_th, ln_bk, ln_gr]
 
-        current_max_x = self.time_data[-1] if self.time_data else 0
+        live_x = self.get_x_data()
+        current_max_x = live_x[-1] if live_x else 0
         overall_max_x = max(max_x, current_max_x)
 
         if overall_max_x > 0:
             self.ax_gear.set_xlim(0, overall_max_x + 1)
+
+        self.ax_gear.set_xlabel(
+            "Distance (m)" if self.x_axis_mode == "distance" else "Temps (s)")
 
         try:
             self.ax_speed.legend(loc='upper right')
@@ -386,6 +417,29 @@ class MainWindow(QMainWindow):
             pass
 
         self.canvas.draw_idle()
+
+    def get_x_data(self):
+        """Retourne les données X actives (temps ou distance) pour le tour en cours."""
+        if self.x_axis_mode == "distance" and self.dist_data:
+            return self.dist_data
+        return self.time_data
+
+    def on_xaxis_changed(self):
+        """Bascule l'axe X entre temps et distance et redessine."""
+        new_mode = "distance" if self.radio_dist.isChecked() else "time"
+        if new_mode == self.x_axis_mode:
+            return
+        self.x_axis_mode = new_mode
+        x_label = "Distance (m)" if self.x_axis_mode == "distance" else "Temps (s)"
+        self.ax_gear.set_xlabel(x_label)
+        x_data = self.get_x_data()
+        if x_data:
+            self.line_speed.set_data(x_data, self.speed_data)
+            self.line_throttle.set_data(x_data, self.throttle_data)
+            self.line_brake.set_data(x_data, self.brake_data)
+            self.line_gear.set_data(x_data, self.gear_data)
+            self.ax_gear.set_xlim(0, max(10, x_data[-1] + 1))
+        self.redraw_saved_laps()
 
     def export_laps_to_excel(self):
         if not self.live_saved_laps:
@@ -409,8 +463,12 @@ class MainWindow(QMainWindow):
         try:
             with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
                 for lap_num, points in self.live_saved_laps.items():
-                    df = pd.DataFrame(points, columns=[
-                                      "Temps (s)", "Vitesse (km/h)", "Throttle (%)", "Brake (%)", "Gear"])
+                    has_dist = bool(points) and len(points[0]) >= 6
+                    cols = ["Temps (s)", "Vitesse (km/h)",
+                            "Throttle (%)", "Brake (%)", "Gear"]
+                    if has_dist:
+                        cols.append("Distance (m)")
+                    df = pd.DataFrame(points, columns=cols)
                     df.to_excel(
                         writer, sheet_name=f"Tour_{lap_num}", index=False)
             print(f"📤 Données exportées avec succès : {filepath}")
@@ -431,7 +489,10 @@ class MainWindow(QMainWindow):
 
                     df = excel_file.parse(sheet_name)
 
-                    if "Throttle (%)" in df.columns:
+                    if "Distance (m)" in df.columns:
+                        points = list(zip(
+                            df["Temps (s)"], df["Vitesse (km/h)"], df["Throttle (%)"], df["Brake (%)"], df["Gear"], df["Distance (m)"]))
+                    elif "Throttle (%)" in df.columns:
                         points = list(zip(
                             df["Temps (s)"], df["Vitesse (km/h)"], df["Throttle (%)"], df["Brake (%)"], df["Gear"]))
                     else:
