@@ -4,7 +4,7 @@ import irsdk
 import pandas as pd
 
 from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QFileDialog, QRadioButton
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 
@@ -208,7 +208,7 @@ class TelemetryWorker(QThread):
                     "track_name": "Circuit", "car_name": "Voiture"
                 })
 
-            time.sleep(1 / 60)
+            time.sleep(1 / 30)
 
     def stop(self):
         self.running = False
@@ -242,6 +242,7 @@ class MainWindow(QMainWindow):
         self.saved_view_active = False
         self.current_track = "Circuit"
         self.current_car = "Voiture"
+        self._plot_dirty = False
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -273,7 +274,11 @@ class MainWindow(QMainWindow):
 
         ctrl_layout = QHBoxLayout()
 
+        # Liste des tours (réduite en largeur et hauteur)
         self.lap_list = QListWidget()
+        self.lap_list.setMaximumWidth(280)
+        self.lap_list.setMinimumWidth(180)
+        self.lap_list.setMaximumHeight(130)
         self.lap_list.itemChanged.connect(self.on_lap_selection_changed)
         ctrl_layout.addWidget(self.lap_list)
 
@@ -304,10 +309,32 @@ class MainWindow(QMainWindow):
         layout.addLayout(ctrl_layout)
 
         # --- CONFIGURATION MULTI-GRAPHIQUES MATPLOTLIB ---
+        # Augmente la taille par défaut de la figure pour des graphes plus grands
         self.figure, (self.ax_speed, self.ax_inputs, self.ax_gear) = plt.subplots(
             3, 1, sharex=True, gridspec_kw={'height_ratios': [3, 2, 1]})
+        # Ajuste la taille en pouces (largeur, hauteur) pour agrandir les tracés
+        try:
+            self.figure.set_size_inches(10, 7)
+        except Exception:
+            pass
+
         self.canvas = FigureCanvas(self.figure)
-        layout.addWidget(self.canvas)
+
+        # Place la figure dans un conteneur scrollable verticalement (barre à droite)
+        from PyQt6.QtWidgets import QScrollArea
+        canvas_container = QWidget()
+        canvas_layout = QVBoxLayout(canvas_container)
+        canvas_layout.setContentsMargins(0, 0, 0, 0)
+        canvas_layout.addWidget(self.canvas)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setWidget(canvas_container)
+        # Hauteur minimale suffisante pour afficher les 3 graphiques + scroll
+        canvas_container.setMinimumHeight(900)
+
+        # stretch=1 : le scroll area prend tout l'espace vertical restant
+        layout.addWidget(self.scroll_area, 1)
 
         # Graphique 1 : Vitesse
         self.ax_speed.set_ylabel("Vitesse (km/h)")
@@ -336,6 +363,12 @@ class MainWindow(QMainWindow):
         self.ax_gear.grid(True, alpha=0.3)
 
         self.figure.tight_layout()
+
+        # Timer de rendu découplé : matplotlib ne redessine qu'à ~15 fps
+        self._plot_timer = QTimer(self)
+        self._plot_timer.setInterval(66)
+        self._plot_timer.timeout.connect(self._flush_plot)
+        self._plot_timer.start()
 
         self.worker = TelemetryWorker()
         self.worker.telemetry_signal.connect(self.update_gui)
@@ -487,7 +520,13 @@ class MainWindow(QMainWindow):
             live_x = self.get_x_data()
             self.ax_gear.set_xlim(0, max(10, live_x[-1] + 1))
 
-        self.canvas.draw_idle()
+        self._plot_dirty = True
+
+    def _flush_plot(self):
+        """Appelé par le QTimer : redessine le canvas seulement si nécessaire."""
+        if self._plot_dirty:
+            self.canvas.draw_idle()
+            self._plot_dirty = False
 
     def add_lap_to_list_widget(self, lap_num, total_time, origin="Session"):
         for i in range(self.lap_list.count()):
@@ -587,7 +626,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        self.canvas.draw_idle()
+        self._plot_dirty = True
 
     def get_x_data(self):
         """Retourne les données X actives (temps ou distance) pour le tour en cours."""
