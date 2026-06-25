@@ -1,5 +1,6 @@
 import sys
 import time
+import math
 import irsdk
 import pandas as pd
 
@@ -167,6 +168,13 @@ class TelemetryWorker(QThread):
                     _ld = self.ir["LapDist"]
                     lap_dist = float(_ld) if _ld is not None else 0.0
 
+                    rpm = self._safe_ir_read("RPM", 0.0)
+                    try:
+                        steer = math.degrees(
+                            float(self.ir["SteeringWheelAngle"] or 0.0))
+                    except Exception:
+                        steer = 0.0
+
                     self.telemetry_signal.emit({
                         "lap_num": current_lap,
                         "lap_time": lap_time,
@@ -187,6 +195,8 @@ class TelemetryWorker(QThread):
                         "tire_wear_lr": self._derive_wheel_wear("LR"),
                         "tire_wear_rr": self._derive_wheel_wear("RR"),
                         "lap_dist": lap_dist,
+                        "rpm": rpm,
+                        "steer": steer,
                         "in_outlap": self.in_outlap,
                         "is_in_pit": is_in_pit,
                         "is_in_garage": is_in_garage,
@@ -231,6 +241,8 @@ class MainWindow(QMainWindow):
         self.brake_data = []
         self.gear_data = []
         self.dist_data = []
+        self.rpm_data = []
+        self.steer_data = []
         self.x_axis_mode = "time"
         self.current_lap_buffer = []
 
@@ -245,6 +257,9 @@ class MainWindow(QMainWindow):
         self._plot_dirty = False
         self._fill_throttle = None
         self._fill_brake = None
+        # Palette de couleurs cyclique pour les tours compar\u00e9s (style Garage 61)
+        self._lap_palette = ["#e8112d", "#1565c0", "#2e7d32",
+                             "#f9a825", "#6a1b9a", "#00838f", "#d84315"]
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -252,14 +267,14 @@ class MainWindow(QMainWindow):
 
         self.label_info = QLabel("Piste : --- | Voiture : ---")
         self.label_info.setStyleSheet(
-            "font-size: 12px; color: #888; padding: 2px 4px;")
+            "font-size: 12px; color: #777; padding: 2px 4px;")
         layout.addWidget(self.label_info)
 
-        # --- RUBAN DE DONNÉES (bandeau stylisé) ---
+        # --- RUBAN DE DONNÉES (bandeau stylisé clair) ---
         ribbon = QFrame()
         ribbon.setObjectName("ribbon")
         ribbon.setStyleSheet(
-            "#ribbon { background-color: #1c1c24; border: 1px solid #3c3c46;"
+            "#ribbon { background-color: #f5f5f7; border: 1px solid #dcdce0;"
             " border-radius: 8px; }")
         info_row = QHBoxLayout(ribbon)
         info_row.setContentsMargins(14, 10, 14, 10)
@@ -268,7 +283,7 @@ class MainWindow(QMainWindow):
         self.label_speed = QLabel(
             "Vitesse : 0 km/h | Accel : 0% | Frein : 0% | Rapport : N")
         self.label_speed.setStyleSheet(
-            "font-size: 17px; font-weight: bold; color: #f5f5f5; background: transparent;")
+            "font-size: 17px; font-weight: bold; color: #1a1a1a; background: transparent;")
         info_row.addWidget(self.label_speed)
 
         info_row.addStretch()
@@ -280,8 +295,8 @@ class MainWindow(QMainWindow):
         self.tire_label_rr = QLabel("RR: --°C")
         for lbl in (self.tire_label_lf, self.tire_label_rf, self.tire_label_lr, self.tire_label_rr):
             lbl.setStyleSheet(
-                "font-size:14px; font-weight:bold; color: #cccccc;"
-                " background:#26262f; border-radius:6px; padding:4px 10px; margin-left:8px;")
+                "font-size:14px; font-weight:bold; color: #555;"
+                " background:#ececef; border-radius:6px; padding:4px 10px; margin-left:8px;")
             info_row.addWidget(lbl)
 
         layout.addWidget(ribbon)
@@ -298,9 +313,9 @@ class MainWindow(QMainWindow):
 
         # --- PANNEAU DE CONTRÔLE COMPACT ---
         _btn_css = (
-            "QPushButton { background:#26262f; color:#f5f5f5; border:1px solid #3c3c46;"
+            "QPushButton { background:#ffffff; color:#222; border:1px solid #cfcfcf;"
             " border-radius:6px; padding:6px 12px; font-size:12px; }"
-            " QPushButton:hover { background:#33333f; }")
+            " QPushButton:hover { background:#eef2ff; border-color:#9db4ff; }")
         self.btn_export = QPushButton("\U0001F4E4 Exporter")
         self.btn_export.setToolTip("Exporter les tours Live (Excel)")
         self.btn_export.setStyleSheet(_btn_css)
@@ -325,62 +340,71 @@ class MainWindow(QMainWindow):
         ctrl_row.addWidget(self.btn_import)
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setStyleSheet("color:#3c3c46;")
+        sep.setStyleSheet("color:#cfcfcf;")
         ctrl_row.addWidget(sep)
         ctrl_row.addWidget(xaxis_label)
         ctrl_row.addWidget(self.radio_time)
         ctrl_row.addWidget(self.radio_dist)
         ctrl_row.addStretch()
 
+        # Panneau des temps par secteur (S1/S2/S3 + écarts)
+        self.sector_label = QLabel(
+            "Secteurs : sélectionne un ou plusieurs tours")
+        self.sector_label.setTextFormat(Qt.TextFormat.RichText)
+        self.sector_label.setStyleSheet(
+            "font-size:12px; color:#333; background:#f5f5f7;"
+            " border:1px solid #dcdce0; border-radius:6px; padding:6px 10px;")
+
         ctrl_col = QVBoxLayout()
         ctrl_col.addLayout(ctrl_row)
+        ctrl_col.addWidget(self.sector_label)
         ctrl_col.addStretch()
         ctrl_layout.addLayout(ctrl_col)
         layout.addLayout(ctrl_layout)
 
-        # --- THÈME & CONFIGURATION MULTI-GRAPHIQUES MATPLOTLIB ---
+        # --- THÈME CLAIR (style Garage 61) ---
         plt.rcParams.update({
-            'figure.facecolor':  '#0e0e12',
-            'axes.facecolor':    '#1c1c24',
-            'axes.edgecolor':    '#55555f',
-            'axes.linewidth':    1.1,
-            'text.color':        '#f5f5f5',
-            'axes.labelcolor':   '#f5f5f5',
-            'xtick.color':       '#c8c8c8',
-            'ytick.color':       '#c8c8c8',
-            'xtick.labelsize':   10,
-            'ytick.labelsize':   10,
-            'grid.color':        '#3c3c46',
+            'figure.facecolor':  '#ffffff',
+            'axes.facecolor':    '#ffffff',
+            'axes.edgecolor':    '#cfcfcf',
+            'axes.linewidth':    1.0,
+            'text.color':        '#333333',
+            'axes.labelcolor':   '#333333',
+            'xtick.color':       '#666666',
+            'ytick.color':       '#666666',
+            'xtick.labelsize':   9,
+            'ytick.labelsize':   9,
+            'grid.color':        '#e3e3e3',
             'grid.linestyle':    '--',
-            'grid.linewidth':    0.6,
-            'grid.alpha':        0.6,
-            'legend.facecolor':  '#26262f',
-            'legend.edgecolor':  '#6a6a75',
-            'legend.labelcolor': '#f5f5f5',
-            'font.size':         11,
-            'axes.labelsize':    11,
-            'axes.labelweight':  'bold',
+            'grid.linewidth':    0.7,
+            'grid.alpha':        0.9,
+            'font.size':         10,
             'axes.spines.top':   False,
             'axes.spines.right': False,
         })
 
-        self.figure, (self.ax_speed, self.ax_inputs, self.ax_gear) = plt.subplots(
-            3, 1, sharex=True, gridspec_kw={'height_ratios': [3, 2, 1]})
-        self.figure.set_facecolor('#0e0e12')
+        self.figure, axes = plt.subplots(
+            6, 1, sharex=True,
+            gridspec_kw={'height_ratios': [2.4, 1.3, 1.3, 1.0, 1.4, 1.4]})
+        (self.ax_speed, self.ax_throttle, self.ax_brake,
+         self.ax_gear, self.ax_rpm, self.ax_steer) = axes
+        self.all_axes = list(axes)
+        self.ax_bottom = self.ax_steer
+        self.figure.set_facecolor('#ffffff')
         self.figure.subplots_adjust(
-            left=0.08, right=0.97, top=0.97, bottom=0.07, hspace=0.12)
+            left=0.07, right=0.93, top=0.99, bottom=0.04, hspace=0.18)
 
         self.canvas = FigureCanvas(self.figure)
 
-        # Barre d'outils matplotlib : zoom rectange, pan, reset, sauvegarde
+        # Barre d'outils matplotlib : zoom, pan, reset, sauvegarde
         self.nav_toolbar = NavToolbar(self.canvas, self)
         self.nav_toolbar.setStyleSheet(
-            "background:#26262f; color:#f5f5f5; border: none;")
+            "background:#f0f0f0; color:#333; border: none;")
         layout.addWidget(self.nav_toolbar)
 
         # Conteneur scrollable verticalement
         canvas_container = QWidget()
-        canvas_container.setStyleSheet("background-color: #0e0e12;")
+        canvas_container.setStyleSheet("background-color: #ffffff;")
         canvas_layout = QVBoxLayout(canvas_container)
         canvas_layout.setContentsMargins(0, 0, 0, 0)
         canvas_layout.addWidget(self.canvas)
@@ -389,37 +413,73 @@ class MainWindow(QMainWindow):
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setWidget(canvas_container)
         self.scroll_area.setStyleSheet(
-            "background-color: #0e0e12; border: none;")
-        canvas_container.setMinimumHeight(900)
+            "background-color: #ffffff; border: none;")
+        canvas_container.setMinimumHeight(1150)
 
         # stretch=1 : le scroll area prend tout l'espace vertical restant
         layout.addWidget(self.scroll_area, 1)
 
+        # --- BARRE DE SECTEURS (bas, style Garage 61) ---
+        self.sector_bar_labels = []
+        sector_bar = QHBoxLayout()
+        sector_bar.setSpacing(3)
+        for name in ("S1", "S2", "S3"):
+            seg = QLabel(name)
+            seg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            seg.setStyleSheet(
+                "font-size:13px; font-weight:bold; color:#555;"
+                " background:#e6e6ea; padding:6px; border-radius:4px;")
+            self.sector_bar_labels.append(seg)
+            sector_bar.addWidget(seg)
+        layout.addLayout(sector_bar)
+
+        # Couleur principale du tour Live
+        self.live_col = '#e8112d'
+
+        def _channel_label(ax, text):
+            ax.text(1.012, 0.5, text, transform=ax.transAxes, rotation=270,
+                    va='center', ha='left', fontsize=10, fontweight='bold',
+                    color='#555555')
+
         # Graphique 1 : Vitesse
-        self.ax_speed.set_ylabel("Vitesse (km/h)")
         self.ax_speed.set_ylim(0, 310)
         self.line_speed, = self.ax_speed.plot(
-            [], [], color='#FFD500', lw=2.4, label='Vitesse (Live)')
-        self.ax_speed.legend(loc='upper right', fontsize=10)
-        self.ax_speed.grid(True)
+            [], [], color=self.live_col, lw=1.4)
+        _channel_label(self.ax_speed, "Vitesse (km/h)")
 
-        # Graphique 2 : Pédales (Throttle & Brake)
-        self.ax_inputs.set_ylabel("Pédales (%)")
-        self.ax_inputs.set_ylim(-5, 105)
-        self.line_throttle, = self.ax_inputs.plot(
-            [], [], color='#00E676', lw=2.0, label='Accélérateur')
-        self.line_brake, = self.ax_inputs.plot(
-            [], [], color='#FF5252', lw=2.0, label='Frein')
-        self.ax_inputs.legend(loc='upper right', fontsize=10)
-        self.ax_inputs.grid(True)
+        # Graphique 2 : Accélérateur
+        self.ax_throttle.set_ylim(-3, 103)
+        self.line_throttle, = self.ax_throttle.plot(
+            [], [], color=self.live_col, lw=1.4)
+        _channel_label(self.ax_throttle, "Accélérateur (%)")
 
-        # Graphique 3 : Rapport (Gear)
-        self.ax_gear.set_ylabel("Rapport")
-        self.ax_gear.set_xlabel("Temps (s)")
+        # Graphique 3 : Frein
+        self.ax_brake.set_ylim(-3, 103)
+        self.line_brake, = self.ax_brake.plot(
+            [], [], color=self.live_col, lw=1.4)
+        _channel_label(self.ax_brake, "Frein (%)")
+
+        # Graphique 4 : Rapport
         self.ax_gear.set_ylim(-1.5, 8.5)
         self.line_gear, = self.ax_gear.plot(
-            [], [], color='#40C4FF', lw=2.0, drawstyle='steps-mid', label='Rapport')
-        self.ax_gear.grid(True)
+            [], [], color=self.live_col, lw=1.4, drawstyle='steps-mid')
+        _channel_label(self.ax_gear, "Rapport")
+
+        # Graphique 5 : RPM
+        self.ax_rpm.set_ylim(0, 9000)
+        self.line_rpm, = self.ax_rpm.plot([], [], color=self.live_col, lw=1.4)
+        _channel_label(self.ax_rpm, "RPM")
+
+        # Graphique 6 : Angle volant
+        self.ax_steer.set_ylim(-200, 200)
+        self.line_steer, = self.ax_steer.plot(
+            [], [], color=self.live_col, lw=1.4)
+        _channel_label(self.ax_steer, "Volant (°)")
+
+        self.ax_bottom.set_xlabel("Temps (s)")
+        for ax in self.all_axes:
+            ax.grid(True)
+            ax.margins(x=0)
 
         # Timer de rendu découplé : matplotlib ne redessine qu'à ~15 fps
         self._plot_timer = QTimer(self)
@@ -452,6 +512,8 @@ class MainWindow(QMainWindow):
         w_rr = data.get("tire_wear_rr", None)
 
         lap_dist = data.get("lap_dist", 0.0)
+        rpm = data.get("rpm", 0.0)
+        steer = data.get("steer", 0.0)
         self.current_track = data["track_name"]
         self.current_car = data["car_name"]
         self.label_info.setText(
@@ -481,6 +543,8 @@ class MainWindow(QMainWindow):
             self.brake_data.clear()
             self.gear_data.clear()
             self.dist_data.clear()
+            self.rpm_data.clear()
+            self.steer_data.clear()
             self.current_lap_buffer.clear()
             self.last_processed_lap = lap_num
 
@@ -519,7 +583,7 @@ class MainWindow(QMainWindow):
 
         def badge_css(color):
             return (f"font-size:14px; font-weight:bold; color: {color};"
-                    " background:#26262f; border-radius:6px; padding:4px 10px; margin-left:8px;")
+                    " background:#ececef; border-radius:6px; padding:4px 10px; margin-left:8px;")
 
         if t_lf is not None or w_lf is not None:
             txt = f"LF: {t_lf:.0f}°C / W:{((w_lf or 0.0) * 100):.0f}%"
@@ -548,9 +612,11 @@ class MainWindow(QMainWindow):
             self.brake_data.append(brake)
             self.gear_data.append(gear)
             self.dist_data.append(lap_dist)
+            self.rpm_data.append(rpm)
+            self.steer_data.append(steer)
 
             self.current_lap_buffer.append(
-                (lap_time, speed, throttle, brake, gear, lap_dist))
+                (lap_time, speed, throttle, brake, gear, lap_dist, rpm, steer))
 
             x_data = self.get_x_data()
             self.line_speed.set_visible(True)
@@ -564,16 +630,24 @@ class MainWindow(QMainWindow):
 
             self.line_gear.set_visible(True)
             self.line_gear.set_data(x_data, self.gear_data)
+
+            self.line_rpm.set_visible(True)
+            self.line_rpm.set_data(x_data, self.rpm_data)
+
+            self.line_steer.set_visible(True)
+            self.line_steer.set_data(x_data, self.steer_data)
         else:
             if in_outlap or is_in_pit or is_in_garage:
                 self.line_speed.set_visible(False)
                 self.line_throttle.set_visible(False)
                 self.line_brake.set_visible(False)
                 self.line_gear.set_visible(False)
+                self.line_rpm.set_visible(False)
+                self.line_steer.set_visible(False)
 
         if not self.saved_view_active and self.time_data:
             live_x = self.get_x_data()
-            self.ax_gear.set_xlim(0, max(10, live_x[-1] + 1))
+            self.ax_bottom.set_xlim(0, max(10, live_x[-1] + 1))
 
         self._plot_dirty = True
 
@@ -593,12 +667,12 @@ class MainWindow(QMainWindow):
             # Zones remplies pour le tour en direct
             if self.time_data and self.line_speed.get_visible():
                 x_data = self.get_x_data()
-                self._fill_throttle = self.ax_inputs.fill_between(
+                self._fill_throttle = self.ax_throttle.fill_between(
                     x_data, 0, self.throttle_data,
-                    alpha=0.18, color='#00E676', linewidth=0)
-                self._fill_brake = self.ax_inputs.fill_between(
+                    alpha=0.15, color=self.live_col, linewidth=0)
+                self._fill_brake = self.ax_brake.fill_between(
                     x_data, 0, self.brake_data,
-                    alpha=0.18, color='#FF5252', linewidth=0)
+                    alpha=0.15, color=self.live_col, linewidth=0)
 
             self.canvas.draw_idle()
             self._plot_dirty = False
@@ -642,66 +716,140 @@ class MainWindow(QMainWindow):
         self.saved_view_active = len(laps_to_show) > 0
 
         max_x = 0
-        for lap in laps_to_show:
+        sector_rows = []  # (label, color, (s1, s2, s3))
+        for idx, lap in enumerate(laps_to_show):
             k = lap["id"]
             origin = lap["origin"]
+            color = self._lap_palette[idx % len(self._lap_palette)]
 
             pts = self.live_saved_laps.get(
                 k, []) if origin == "Session" else self.imported_laps.get(k, [])
 
             if pts:
-                # CORRECTION ICI : On vérifie la taille du premier élément de 'pts'
                 has_extended_telemetry = len(pts[0]) > 2
+                has_dist = len(pts[0]) >= 6
+                has_rpm = len(pts[0]) >= 7
+                has_steer = len(pts[0]) >= 8
 
-                if self.x_axis_mode == "distance" and len(pts[0]) >= 6:
+                if self.x_axis_mode == "distance" and has_dist:
                     xs = [p[5] for p in pts]
                 else:
                     xs = [p[0] for p in pts]
                 ys_speed = [p[1] for p in pts]
-
-                # Utilisation de la condition corrigée
-                ys_throt = [p[2]
-                            for p in pts] if has_extended_telemetry else [0]*len(pts)
-                ys_brake = [p[3]
-                            for p in pts] if has_extended_telemetry else [0]*len(pts)
-                ys_gear = [p[4]
-                           for p in pts] if has_extended_telemetry else [0]*len(pts)
+                ys_throt = [p[2] for p in pts] if has_extended_telemetry else [
+                    0] * len(pts)
+                ys_brake = [p[3] for p in pts] if has_extended_telemetry else [
+                    0] * len(pts)
+                ys_gear = [p[4] for p in pts] if has_extended_telemetry else [
+                    0] * len(pts)
+                ys_rpm = [p[6] for p in pts] if has_rpm else [0] * len(pts)
+                ys_steer = [p[7] for p in pts] if has_steer else [0] * len(pts)
 
                 max_x = max(max_x, max(xs))
 
-                label_name = f"S-T{k}" if origin == "Session" else f"I-T{k}"
+                label_name = f"T{k}" if origin == "Session" else f"I-T{k}"
 
-                # Tracé sur l'axe Vitesse
                 ln_sp, = self.ax_speed.plot(
-                    xs, ys_speed, lw=1.2, alpha=0.6, linestyle='--', label=f"{label_name} (Vit)")
-                # Tracé sur l'axe Inputs (Accélérateur en pointillé vert léger, Frein en rouge léger)
-                ln_th, = self.ax_inputs.plot(
-                    xs, ys_throt, lw=1.2, alpha=0.7, linestyle=':', color='#00E676')
-                ln_bk, = self.ax_inputs.plot(
-                    xs, ys_brake, lw=1.2, alpha=0.7, linestyle=':', color='#FF5252')
-                # Tracé sur l'axe Boite
+                    xs, ys_speed, lw=1.4, alpha=0.9, color=color, label=label_name)
+                ln_th, = self.ax_throttle.plot(
+                    xs, ys_throt, lw=1.3, alpha=0.9, color=color)
+                ln_bk, = self.ax_brake.plot(
+                    xs, ys_brake, lw=1.3, alpha=0.9, color=color)
                 ln_gr, = self.ax_gear.plot(
-                    xs, ys_gear, lw=1.0, alpha=0.5, linestyle='--', drawstyle='steps-mid')
+                    xs, ys_gear, lw=1.3, alpha=0.9, color=color, drawstyle='steps-mid')
+                ln_rp, = self.ax_rpm.plot(
+                    xs, ys_rpm, lw=1.3, alpha=0.9, color=color)
+                ln_st, = self.ax_steer.plot(
+                    xs, ys_steer, lw=1.3, alpha=0.9, color=color)
 
                 self.saved_lap_lines[f"{origin}_{k}"] = [
-                    ln_sp, ln_th, ln_bk, ln_gr]
+                    ln_sp, ln_th, ln_bk, ln_gr, ln_rp, ln_st]
+
+                sectors = self._compute_sectors(pts)
+                if sectors is not None:
+                    sector_rows.append((label_name, color, sectors))
 
         live_x = self.get_x_data()
         current_max_x = live_x[-1] if live_x else 0
         overall_max_x = max(max_x, current_max_x)
 
         if overall_max_x > 0:
-            self.ax_gear.set_xlim(0, overall_max_x + 1)
+            self.ax_bottom.set_xlim(0, overall_max_x + 1)
 
-        self.ax_gear.set_xlabel(
+        self.ax_bottom.set_xlabel(
             "Distance (m)" if self.x_axis_mode == "distance" else "Temps (s)")
 
         try:
-            self.ax_speed.legend(loc='upper right')
+            self.ax_speed.legend(loc='upper right', fontsize=9, ncol=4)
         except Exception:
             pass
 
+        self._update_sector_display(sector_rows)
         self._plot_dirty = True
+
+    def _compute_sectors(self, pts):
+        """Découpe un tour en 3 secteurs égaux en distance et retourne (s1, s2, s3)."""
+        if not pts or len(pts[0]) < 6:
+            return None
+        total_dist = pts[-1][5]
+        total_time = pts[-1][0]
+        if total_dist <= 0:
+            return None
+        b1, b2 = total_dist / 3.0, 2.0 * total_dist / 3.0
+        t1 = t2 = None
+        for p in pts:
+            if t1 is None and p[5] >= b1:
+                t1 = p[0]
+            if t2 is None and p[5] >= b2:
+                t2 = p[0]
+        if t1 is None:
+            t1 = total_time
+        if t2 is None:
+            t2 = total_time
+        return (t1, t2 - t1, total_time - t2)
+
+    def _update_sector_display(self, sector_rows):
+        """Met à jour le panneau des temps secteur + la barre du bas."""
+        if not sector_rows:
+            self.sector_label.setText(
+                "Secteurs : sélectionne un ou plusieurs tours")
+            for i, seg in enumerate(self.sector_bar_labels):
+                seg.setText(f"S{i+1}")
+                seg.setStyleSheet(
+                    "font-size:13px; font-weight:bold; color:#555;"
+                    " background:#e6e6ea; padding:6px; border-radius:4px;")
+            return
+
+        # Meilleur temps par secteur (référence)
+        best = [min(r[2][s] for r in sector_rows) for s in range(3)]
+
+        def fmt(t):
+            return f"{t:.2f}"
+
+        # Tableau HTML des tours et écarts
+        html = ("<table cellspacing='6'><tr>"
+                "<td><b>Tour</b></td><td><b>S1</b></td>"
+                "<td><b>S2</b></td><td><b>S3</b></td><td><b>Total</b></td></tr>")
+        for name, color, sec in sector_rows:
+            total = sum(sec)
+            cells = ""
+            for s in range(3):
+                gap = sec[s] - best[s]
+                gtxt = "" if gap <= 0.001 else f" <span style='color:#888'>(+{gap:.2f})</span>"
+                cells += f"<td>{fmt(sec[s])}{gtxt}</td>"
+            html += (f"<tr><td><b style='color:{color}'>■</b> {name}</td>"
+                     f"{cells}<td><b>{fmt(total)}</b></td></tr>")
+        html += "</table>"
+        self.sector_label.setText(html)
+
+        # Barre du bas : meilleur secteur global, coloré par le tour qui le détient
+        for s, seg in enumerate(self.sector_bar_labels):
+            # Couleur du tour qui possède le meilleur secteur s
+            holder = min(sector_rows, key=lambda r: r[2][s])
+            seg.setText(f"S{s+1}  {fmt(best[s])}s")
+            seg.setStyleSheet(
+                f"font-size:13px; font-weight:bold; color:#fff;"
+                f" background:{holder[1]}; padding:6px; border-radius:4px;")
 
     def get_x_data(self):
         """Retourne les données X actives (temps ou distance) pour le tour en cours."""
@@ -716,14 +864,16 @@ class MainWindow(QMainWindow):
             return
         self.x_axis_mode = new_mode
         x_label = "Distance (m)" if self.x_axis_mode == "distance" else "Temps (s)"
-        self.ax_gear.set_xlabel(x_label)
+        self.ax_bottom.set_xlabel(x_label)
         x_data = self.get_x_data()
         if x_data:
             self.line_speed.set_data(x_data, self.speed_data)
             self.line_throttle.set_data(x_data, self.throttle_data)
             self.line_brake.set_data(x_data, self.brake_data)
             self.line_gear.set_data(x_data, self.gear_data)
-            self.ax_gear.set_xlim(0, max(10, x_data[-1] + 1))
+            self.line_rpm.set_data(x_data, self.rpm_data)
+            self.line_steer.set_data(x_data, self.steer_data)
+            self.ax_bottom.set_xlim(0, max(10, x_data[-1] + 1))
         self.redraw_saved_laps()
 
     def export_laps_to_excel(self):
@@ -748,12 +898,16 @@ class MainWindow(QMainWindow):
         try:
             with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
                 for lap_num, points in self.live_saved_laps.items():
-                    has_dist = bool(points) and len(points[0]) >= 6
+                    n = len(points[0]) if points else 5
                     cols = ["Temps (s)", "Vitesse (km/h)",
                             "Throttle (%)", "Brake (%)", "Gear"]
-                    if has_dist:
+                    if n >= 6:
                         cols.append("Distance (m)")
-                    df = pd.DataFrame(points, columns=cols)
+                    if n >= 7:
+                        cols.append("RPM")
+                    if n >= 8:
+                        cols.append("Volant (deg)")
+                    df = pd.DataFrame(points, columns=cols[:n])
                     df.to_excel(
                         writer, sheet_name=f"Tour_{lap_num}", index=False)
             print(f"📤 Données exportées avec succès : {filepath}")
@@ -774,7 +928,16 @@ class MainWindow(QMainWindow):
 
                     df = excel_file.parse(sheet_name)
 
-                    if "Distance (m)" in df.columns:
+                    if "Volant (deg)" in df.columns:
+                        points = list(zip(
+                            df["Temps (s)"], df["Vitesse (km/h)"], df["Throttle (%)"],
+                            df["Brake (%)"], df["Gear"], df["Distance (m)"],
+                            df["RPM"], df["Volant (deg)"]))
+                    elif "RPM" in df.columns:
+                        points = list(zip(
+                            df["Temps (s)"], df["Vitesse (km/h)"], df["Throttle (%)"],
+                            df["Brake (%)"], df["Gear"], df["Distance (m)"], df["RPM"]))
+                    elif "Distance (m)" in df.columns:
                         points = list(zip(
                             df["Temps (s)"], df["Vitesse (km/h)"], df["Throttle (%)"], df["Brake (%)"], df["Gear"], df["Distance (m)"]))
                     elif "Throttle (%)" in df.columns:
