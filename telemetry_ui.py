@@ -22,10 +22,92 @@ class TelemetryWorker(QThread):
         self.last_lap = -1
         self.lap_start_time = 0.0
         self.in_outlap = True
+        self._dumped_ir_keys = False
+
+    def _safe_ir_read(self, name, default=0.0):
+        try:
+            val = self.ir[name]
+            if val is None:
+                return default
+            return float(val)
+        except Exception:
+            return default
+
+    def _derive_wheel_temp(self, wheel_prefix):
+        """Compute average temperature for a wheel from possible fields.
+        Known fields in CSV: RFtempCL, RFtempCM, RFtempCR, etc.
+        """
+        try:
+            # try common full-name first
+            name_map = {
+                'LF': ['TireTempLeftFront'],
+                'RF': ['TireTempRightFront'],
+                'LR': ['TireTempLeftRear'],
+                'RR': ['TireTempRightRear']
+            }
+            for n in name_map.get(wheel_prefix, []):
+                v = self._safe_ir_read(n, None)
+                if v is not None:
+                    return float(v)
+
+            # then try CL/CM/CR triplet
+            parts = ['tempCL', 'tempCM', 'tempCR']
+            vals = []
+            for p in parts:
+                key = f"{wheel_prefix}{p}"
+                try:
+                    v = self.ir[key]
+                    if v is not None:
+                        vals.append(float(v))
+                except Exception:
+                    pass
+            if vals:
+                return sum(vals) / len(vals)
+        except Exception:
+            pass
+        return 0.0
+
+    def _derive_wheel_wear(self, wheel_prefix):
+        """Compute average wear for a wheel from wearL/wearM/wearR fields."""
+        try:
+            parts = ['wearL', 'wearM', 'wearR']
+            vals = []
+            for p in parts:
+                key = f"{wheel_prefix}{p}"
+                try:
+                    v = self.ir[key]
+                    if v is not None:
+                        vals.append(float(v))
+                except Exception:
+                    pass
+            if vals:
+                # wear values in CSV look like percentage integers
+                return sum(vals) / len(vals)
+        except Exception:
+            pass
+        return 0.0
 
     def run(self):
         while self.running:
             if self.ir.startup():
+                # Dump available keys/attributes once when connected (diagnostic)
+                if not self._dumped_ir_keys:
+                    try:
+                        with open("ir_keys_dump.txt", "w", encoding="utf-8") as f:
+                            f.write("--- dir(self.ir) ---\n")
+                            for name in sorted(dir(self.ir)):
+                                f.write(f"{name}\n")
+                            f.write("\n--- readable variables (attempt) ---\n")
+                            for name in sorted(dir(self.ir)):
+                                try:
+                                    val = self.ir[name]
+                                    f.write(f"{name} : {repr(val)}\n")
+                                except Exception:
+                                    # ignore non-indexable attributes
+                                    pass
+                    except Exception:
+                        pass
+                    self._dumped_ir_keys = True
                 self.ir.freeze_var_buffer_latest()
 
                 current_lap = self.ir["Lap"]
@@ -92,6 +174,18 @@ class TelemetryWorker(QThread):
                         "throttle": throttle,
                         "brake": brake,
                         "gear": gear,
+                        # Tentative de lecture des températures pneus (noms courants iRacing)
+                        # Lecture sûre des températures pneus (SDK via index)
+                        # lecture classique puis fallback sur champs par capot/clm/cr
+                        "tire_temp_lf": self._derive_wheel_temp("LF"),
+                        "tire_temp_rf": self._derive_wheel_temp("RF"),
+                        "tire_temp_lr": self._derive_wheel_temp("LR"),
+                        "tire_temp_rr": self._derive_wheel_temp("RR"),
+                        # Lecture de l'usure des pneus (si disponible)
+                        "tire_wear_lf": self._derive_wheel_wear("LF"),
+                        "tire_wear_rf": self._derive_wheel_wear("RF"),
+                        "tire_wear_lr": self._derive_wheel_wear("LR"),
+                        "tire_wear_rr": self._derive_wheel_wear("RR"),
                         "lap_dist": lap_dist,
                         "in_outlap": self.in_outlap,
                         "is_in_pit": is_in_pit,
@@ -157,11 +251,25 @@ class MainWindow(QMainWindow):
         self.label_info.setStyleSheet("font-size: 13px; color: gray;")
         layout.addWidget(self.label_info)
 
+        # Ligne d'information voiture + pneus
+        info_row = QHBoxLayout()
         self.label_speed = QLabel(
             "Vitesse : 0 km/h | Accel : 0% | Frein : 0% | Rapport : N")
         self.label_speed.setStyleSheet(
             "font-size: 14px; font-weight: bold; color: #111;")
-        layout.addWidget(self.label_speed)
+        info_row.addWidget(self.label_speed)
+
+        # Étiquettes températures pneus (LF, RF, LR, RR)
+        self.tire_label_lf = QLabel("LF: --°C")
+        self.tire_label_rf = QLabel("RF: --°C")
+        self.tire_label_lr = QLabel("LR: --°C")
+        self.tire_label_rr = QLabel("RR: --°C")
+        for lbl in (self.tire_label_lf, self.tire_label_rf, self.tire_label_lr, self.tire_label_rr):
+            lbl.setStyleSheet("font-size:12px; color: #333; margin-left:12px;")
+            info_row.addWidget(lbl)
+
+        info_row.addStretch()
+        layout.addLayout(info_row)
 
         ctrl_layout = QHBoxLayout()
 
@@ -243,6 +351,15 @@ class MainWindow(QMainWindow):
         in_outlap = data["in_outlap"]
         is_in_pit = data["is_in_pit"]
         is_in_garage = data["is_in_garage"]
+        # Récupération températures et usures pneus (si présentes dans le signal)
+        t_lf = data.get("tire_temp_lf", None)
+        t_rf = data.get("tire_temp_rf", None)
+        t_lr = data.get("tire_temp_lr", None)
+        t_rr = data.get("tire_temp_rr", None)
+        w_lf = data.get("tire_wear_lf", None)
+        w_rf = data.get("tire_wear_rf", None)
+        w_lr = data.get("tire_wear_lr", None)
+        w_rr = data.get("tire_wear_rr", None)
 
         lap_dist = data.get("lap_dist", 0.0)
         self.current_track = data["track_name"]
@@ -281,6 +398,60 @@ class MainWindow(QMainWindow):
         self.label_speed.setText(
             f"Lap {lap_num} [{status_text}] | Temps : {lap_time:.2f}s | Vitesse : {speed:.1f} km/h | Gaz : {throttle:.0f}% | Frein : {brake:.0f}% | Vitesse : {gear_str}")
 
+        # Mise à jour des températures pneus (si disponibles)
+        def color_for_temp(t):
+            if t is None:
+                return "#666"
+            try:
+                t = float(t)
+            except Exception:
+                return "#666"
+            if t < 70:
+                return "#2e7d32"  # vert
+            if t < 90:
+                return "#f9a825"  # jaune
+            return "#c62828"  # rouge
+
+        def color_for_wear(w):
+            if w is None:
+                return "#666"
+            try:
+                w = float(w)
+            except Exception:
+                return "#666"
+            # w is fraction: 1.0 == 100% remaining. Higher is better.
+            pct = w * 100.0
+            if pct >= 90:
+                return "#2e7d32"
+            if pct >= 70:
+                return "#f9a825"
+            return "#c62828"
+
+        if t_lf is not None or w_lf is not None:
+            txt = f"LF: {t_lf:.0f}°C / W:{((w_lf or 0.0) * 100):.0f}%"
+            self.tire_label_lf.setText(txt)
+            self.tire_label_lf.setStyleSheet(
+                f"font-size:12px; color: {color_for_wear(w_lf)}; margin-left:12px;")
+
+        if t_rf is not None or w_rf is not None:
+            txt = f"RF: {t_rf:.0f}°C / W:{((w_rf or 0.0) * 100):.0f}%"
+            self.tire_label_rf.setText(txt)
+            self.tire_label_rf.setStyleSheet(
+                f"font-size:12px; color: {color_for_wear(w_rf)}; margin-left:12px;")
+
+        if t_lr is not None or w_lr is not None:
+            txt = f"LR: {t_lr:.0f}°C / W:{((w_lr or 0.0) * 100):.0f}%"
+            self.tire_label_lr.setText(txt)
+            self.tire_label_lr.setStyleSheet(
+                f"font-size:12px; color: {color_for_wear(w_lr)}; margin-left:12px;")
+
+        if t_rr is not None or w_rr is not None:
+            txt = f"RR: {t_rr:.0f}°C / W:{((w_rr or 0.0) * 100):.0f}%"
+            self.tire_label_rr.setText(txt)
+            self.tire_label_rr.setStyleSheet(
+                f"font-size:12px; color: {color_for_wear(w_rr)}; margin-left:12px;")
+            self.tire_label_rr.setStyleSheet(
+                f"font-size:12px; color: {color_for_wear(w_rr)}; margin-left:12px;")
         # --- ACCUMULATION & TRACÉ DU TOUR EN DIRECT ---
         if lap_time > 0 and not in_outlap and not is_in_pit and not is_in_garage:
             self.time_data.append(lap_time)

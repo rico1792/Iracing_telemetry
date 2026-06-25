@@ -22,3 +22,12 @@ dist/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Ignore exported Excel files from the telemetry UI
+*.xlsx
+
+# Ignore text diagnostic/export files
+*.txt
+
+# Ignore CSV exports/raw telemetry
+*.csv
