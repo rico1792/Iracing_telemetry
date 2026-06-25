@@ -3,7 +3,7 @@ import time
 import irsdk
 import pandas as pd
 
-from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QFileDialog, QRadioButton, QScrollArea
+from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QFileDialog, QRadioButton, QScrollArea, QFrame
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavToolbar
@@ -251,16 +251,27 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central_widget)
 
         self.label_info = QLabel("Piste : --- | Voiture : ---")
-        self.label_info.setStyleSheet("font-size: 13px; color: gray;")
+        self.label_info.setStyleSheet(
+            "font-size: 12px; color: #888; padding: 2px 4px;")
         layout.addWidget(self.label_info)
 
-        # Ligne d'information voiture + pneus
-        info_row = QHBoxLayout()
+        # --- RUBAN DE DONNÉES (bandeau stylisé) ---
+        ribbon = QFrame()
+        ribbon.setObjectName("ribbon")
+        ribbon.setStyleSheet(
+            "#ribbon { background-color: #1c1c24; border: 1px solid #3c3c46;"
+            " border-radius: 8px; }")
+        info_row = QHBoxLayout(ribbon)
+        info_row.setContentsMargins(14, 10, 14, 10)
+        info_row.setSpacing(0)
+
         self.label_speed = QLabel(
             "Vitesse : 0 km/h | Accel : 0% | Frein : 0% | Rapport : N")
         self.label_speed.setStyleSheet(
-            "font-size: 14px; font-weight: bold; color: #111;")
+            "font-size: 17px; font-weight: bold; color: #f5f5f5; background: transparent;")
         info_row.addWidget(self.label_speed)
+
+        info_row.addStretch()
 
         # Étiquettes températures pneus (LF, RF, LR, RR)
         self.tire_label_lf = QLabel("LF: --°C")
@@ -268,11 +279,12 @@ class MainWindow(QMainWindow):
         self.tire_label_lr = QLabel("LR: --°C")
         self.tire_label_rr = QLabel("RR: --°C")
         for lbl in (self.tire_label_lf, self.tire_label_rf, self.tire_label_lr, self.tire_label_rr):
-            lbl.setStyleSheet("font-size:12px; color: #333; margin-left:12px;")
+            lbl.setStyleSheet(
+                "font-size:14px; font-weight:bold; color: #cccccc;"
+                " background:#26262f; border-radius:6px; padding:4px 10px; margin-left:8px;")
             info_row.addWidget(lbl)
 
-        info_row.addStretch()
-        layout.addLayout(info_row)
+        layout.addWidget(ribbon)
 
         ctrl_layout = QHBoxLayout()
 
@@ -280,34 +292,50 @@ class MainWindow(QMainWindow):
         self.lap_list = QListWidget()
         self.lap_list.setMaximumWidth(280)
         self.lap_list.setMinimumWidth(180)
-        self.lap_list.setMaximumHeight(130)
+        self.lap_list.setMaximumHeight(110)
         self.lap_list.itemChanged.connect(self.on_lap_selection_changed)
         ctrl_layout.addWidget(self.lap_list)
 
-        btn_layout = QVBoxLayout()
-        self.btn_export = QPushButton("📤 Exporter les tours Live (Excel)")
+        # --- PANNEAU DE CONTRÔLE COMPACT ---
+        _btn_css = (
+            "QPushButton { background:#26262f; color:#f5f5f5; border:1px solid #3c3c46;"
+            " border-radius:6px; padding:6px 12px; font-size:12px; }"
+            " QPushButton:hover { background:#33333f; }")
+        self.btn_export = QPushButton("\U0001F4E4 Exporter")
+        self.btn_export.setToolTip("Exporter les tours Live (Excel)")
+        self.btn_export.setStyleSheet(_btn_css)
         self.btn_export.clicked.connect(self.export_laps_to_excel)
-        self.btn_import = QPushButton("📥 Importer des tours (Excel)")
+        self.btn_import = QPushButton("\U0001F4E5 Importer")
+        self.btn_import.setToolTip("Importer des tours (Excel)")
+        self.btn_import.setStyleSheet(_btn_css)
         self.btn_import.clicked.connect(self.import_laps_from_excel)
-        btn_layout.addWidget(self.btn_export)
-        btn_layout.addWidget(self.btn_import)
 
         xaxis_label = QLabel("Axe X :")
-        xaxis_label.setStyleSheet(
-            "font-size: 11px; font-weight: bold; margin-top: 6px;")
-        btn_layout.addWidget(xaxis_label)
-        xaxis_row = QHBoxLayout()
+        xaxis_label.setStyleSheet("font-size: 12px; font-weight: bold;")
         self.radio_time = QRadioButton("Temps (s)")
         self.radio_dist = QRadioButton("Distance (m)")
         self.radio_time.setChecked(True)
         self.radio_time.toggled.connect(self.on_xaxis_changed)
         self.radio_dist.toggled.connect(self.on_xaxis_changed)
-        xaxis_row.addWidget(self.radio_time)
-        xaxis_row.addWidget(self.radio_dist)
-        btn_layout.addLayout(xaxis_row)
-        btn_layout.addStretch()
 
-        ctrl_layout.addLayout(btn_layout)
+        # Une seule ligne horizontale compacte : boutons + séparateur + axe X
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(8)
+        ctrl_row.addWidget(self.btn_export)
+        ctrl_row.addWidget(self.btn_import)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setStyleSheet("color:#3c3c46;")
+        ctrl_row.addWidget(sep)
+        ctrl_row.addWidget(xaxis_label)
+        ctrl_row.addWidget(self.radio_time)
+        ctrl_row.addWidget(self.radio_dist)
+        ctrl_row.addStretch()
+
+        ctrl_col = QVBoxLayout()
+        ctrl_col.addLayout(ctrl_row)
+        ctrl_col.addStretch()
+        ctrl_layout.addLayout(ctrl_col)
         layout.addLayout(ctrl_layout)
 
         # --- THÈME & CONFIGURATION MULTI-GRAPHIQUES MATPLOTLIB ---
@@ -489,31 +517,29 @@ class MainWindow(QMainWindow):
                 return "#f9a825"
             return "#c62828"
 
+        def badge_css(color):
+            return (f"font-size:14px; font-weight:bold; color: {color};"
+                    " background:#26262f; border-radius:6px; padding:4px 10px; margin-left:8px;")
+
         if t_lf is not None or w_lf is not None:
             txt = f"LF: {t_lf:.0f}°C / W:{((w_lf or 0.0) * 100):.0f}%"
             self.tire_label_lf.setText(txt)
-            self.tire_label_lf.setStyleSheet(
-                f"font-size:12px; color: {color_for_wear(w_lf)}; margin-left:12px;")
+            self.tire_label_lf.setStyleSheet(badge_css(color_for_wear(w_lf)))
 
         if t_rf is not None or w_rf is not None:
             txt = f"RF: {t_rf:.0f}°C / W:{((w_rf or 0.0) * 100):.0f}%"
             self.tire_label_rf.setText(txt)
-            self.tire_label_rf.setStyleSheet(
-                f"font-size:12px; color: {color_for_wear(w_rf)}; margin-left:12px;")
+            self.tire_label_rf.setStyleSheet(badge_css(color_for_wear(w_rf)))
 
         if t_lr is not None or w_lr is not None:
             txt = f"LR: {t_lr:.0f}°C / W:{((w_lr or 0.0) * 100):.0f}%"
             self.tire_label_lr.setText(txt)
-            self.tire_label_lr.setStyleSheet(
-                f"font-size:12px; color: {color_for_wear(w_lr)}; margin-left:12px;")
+            self.tire_label_lr.setStyleSheet(badge_css(color_for_wear(w_lr)))
 
         if t_rr is not None or w_rr is not None:
             txt = f"RR: {t_rr:.0f}°C / W:{((w_rr or 0.0) * 100):.0f}%"
             self.tire_label_rr.setText(txt)
-            self.tire_label_rr.setStyleSheet(
-                f"font-size:12px; color: {color_for_wear(w_rr)}; margin-left:12px;")
-            self.tire_label_rr.setStyleSheet(
-                f"font-size:12px; color: {color_for_wear(w_rr)}; margin-left:12px;")
+            self.tire_label_rr.setStyleSheet(badge_css(color_for_wear(w_rr)))
         # --- ACCUMULATION & TRACÉ DU TOUR EN DIRECT ---
         if lap_time > 0 and not in_outlap and not is_in_pit and not is_in_garage:
             self.time_data.append(lap_time)
