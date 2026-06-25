@@ -3,10 +3,10 @@ import time
 import irsdk
 import pandas as pd
 
-from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QFileDialog, QRadioButton
+from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QFileDialog, QRadioButton, QScrollArea
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavToolbar
 
 
 # ==============================================================================
@@ -243,6 +243,8 @@ class MainWindow(QMainWindow):
         self.current_track = "Circuit"
         self.current_car = "Voiture"
         self._plot_dirty = False
+        self._fill_throttle = None
+        self._fill_brake = None
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -308,21 +310,49 @@ class MainWindow(QMainWindow):
         ctrl_layout.addLayout(btn_layout)
         layout.addLayout(ctrl_layout)
 
-        # --- CONFIGURATION MULTI-GRAPHIQUES MATPLOTLIB ---
-        # Augmente la taille par défaut de la figure pour des graphes plus grands
+        # --- THÈME & CONFIGURATION MULTI-GRAPHIQUES MATPLOTLIB ---
+        plt.rcParams.update({
+            'figure.facecolor':  '#0e0e12',
+            'axes.facecolor':    '#1c1c24',
+            'axes.edgecolor':    '#55555f',
+            'axes.linewidth':    1.1,
+            'text.color':        '#f5f5f5',
+            'axes.labelcolor':   '#f5f5f5',
+            'xtick.color':       '#c8c8c8',
+            'ytick.color':       '#c8c8c8',
+            'xtick.labelsize':   10,
+            'ytick.labelsize':   10,
+            'grid.color':        '#3c3c46',
+            'grid.linestyle':    '--',
+            'grid.linewidth':    0.6,
+            'grid.alpha':        0.6,
+            'legend.facecolor':  '#26262f',
+            'legend.edgecolor':  '#6a6a75',
+            'legend.labelcolor': '#f5f5f5',
+            'font.size':         11,
+            'axes.labelsize':    11,
+            'axes.labelweight':  'bold',
+            'axes.spines.top':   False,
+            'axes.spines.right': False,
+        })
+
         self.figure, (self.ax_speed, self.ax_inputs, self.ax_gear) = plt.subplots(
             3, 1, sharex=True, gridspec_kw={'height_ratios': [3, 2, 1]})
-        # Ajuste la taille en pouces (largeur, hauteur) pour agrandir les tracés
-        try:
-            self.figure.set_size_inches(10, 7)
-        except Exception:
-            pass
+        self.figure.set_facecolor('#0e0e12')
+        self.figure.subplots_adjust(
+            left=0.08, right=0.97, top=0.97, bottom=0.07, hspace=0.12)
 
         self.canvas = FigureCanvas(self.figure)
 
-        # Place la figure dans un conteneur scrollable verticalement (barre à droite)
-        from PyQt6.QtWidgets import QScrollArea
+        # Barre d'outils matplotlib : zoom rectange, pan, reset, sauvegarde
+        self.nav_toolbar = NavToolbar(self.canvas, self)
+        self.nav_toolbar.setStyleSheet(
+            "background:#26262f; color:#f5f5f5; border: none;")
+        layout.addWidget(self.nav_toolbar)
+
+        # Conteneur scrollable verticalement
         canvas_container = QWidget()
+        canvas_container.setStyleSheet("background-color: #0e0e12;")
         canvas_layout = QVBoxLayout(canvas_container)
         canvas_layout.setContentsMargins(0, 0, 0, 0)
         canvas_layout.addWidget(self.canvas)
@@ -330,7 +360,8 @@ class MainWindow(QMainWindow):
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setWidget(canvas_container)
-        # Hauteur minimale suffisante pour afficher les 3 graphiques + scroll
+        self.scroll_area.setStyleSheet(
+            "background-color: #0e0e12; border: none;")
         canvas_container.setMinimumHeight(900)
 
         # stretch=1 : le scroll area prend tout l'espace vertical restant
@@ -340,29 +371,27 @@ class MainWindow(QMainWindow):
         self.ax_speed.set_ylabel("Vitesse (km/h)")
         self.ax_speed.set_ylim(0, 310)
         self.line_speed, = self.ax_speed.plot(
-            [], [], color='crimson', lw=2, label='Vitesse (Live)')
-        self.ax_speed.legend(loc='upper right')
-        self.ax_speed.grid(True, alpha=0.3)
+            [], [], color='#FFD500', lw=2.4, label='Vitesse (Live)')
+        self.ax_speed.legend(loc='upper right', fontsize=10)
+        self.ax_speed.grid(True)
 
         # Graphique 2 : Pédales (Throttle & Brake)
         self.ax_inputs.set_ylabel("Pédales (%)")
         self.ax_inputs.set_ylim(-5, 105)
         self.line_throttle, = self.ax_inputs.plot(
-            [], [], color='green', lw=1.5, label='Accélérateur')
+            [], [], color='#00E676', lw=2.0, label='Accélérateur')
         self.line_brake, = self.ax_inputs.plot(
-            [], [], color='red', lw=1.5, label='Frein')
-        self.ax_inputs.legend(loc='upper right')
-        self.ax_inputs.grid(True, alpha=0.3)
+            [], [], color='#FF5252', lw=2.0, label='Frein')
+        self.ax_inputs.legend(loc='upper right', fontsize=10)
+        self.ax_inputs.grid(True)
 
         # Graphique 3 : Rapport (Gear)
         self.ax_gear.set_ylabel("Rapport")
         self.ax_gear.set_xlabel("Temps (s)")
         self.ax_gear.set_ylim(-1.5, 8.5)
         self.line_gear, = self.ax_gear.plot(
-            [], [], color='purple', lw=1.5, drawstyle='steps-mid', label='Rapport')
-        self.ax_gear.grid(True, alpha=0.3)
-
-        self.figure.tight_layout()
+            [], [], color='#40C4FF', lw=2.0, drawstyle='steps-mid', label='Rapport')
+        self.ax_gear.grid(True)
 
         # Timer de rendu découplé : matplotlib ne redessine qu'à ~15 fps
         self._plot_timer = QTimer(self)
@@ -525,6 +554,26 @@ class MainWindow(QMainWindow):
     def _flush_plot(self):
         """Appelé par le QTimer : redessine le canvas seulement si nécessaire."""
         if self._plot_dirty:
+            # Suppression des anciennes zones remplies
+            for attr in ('_fill_throttle', '_fill_brake'):
+                coll = getattr(self, attr, None)
+                if coll is not None:
+                    try:
+                        coll.remove()
+                    except Exception:
+                        pass
+                    setattr(self, attr, None)
+
+            # Zones remplies pour le tour en direct
+            if self.time_data and self.line_speed.get_visible():
+                x_data = self.get_x_data()
+                self._fill_throttle = self.ax_inputs.fill_between(
+                    x_data, 0, self.throttle_data,
+                    alpha=0.18, color='#00E676', linewidth=0)
+                self._fill_brake = self.ax_inputs.fill_between(
+                    x_data, 0, self.brake_data,
+                    alpha=0.18, color='#FF5252', linewidth=0)
+
             self.canvas.draw_idle()
             self._plot_dirty = False
 
@@ -601,9 +650,9 @@ class MainWindow(QMainWindow):
                     xs, ys_speed, lw=1.2, alpha=0.6, linestyle='--', label=f"{label_name} (Vit)")
                 # Tracé sur l'axe Inputs (Accélérateur en pointillé vert léger, Frein en rouge léger)
                 ln_th, = self.ax_inputs.plot(
-                    xs, ys_throt, lw=1.0, alpha=0.5, linestyle=':', color='green')
+                    xs, ys_throt, lw=1.2, alpha=0.7, linestyle=':', color='#00E676')
                 ln_bk, = self.ax_inputs.plot(
-                    xs, ys_brake, lw=1.0, alpha=0.5, linestyle=':', color='red')
+                    xs, ys_brake, lw=1.2, alpha=0.7, linestyle=':', color='#FF5252')
                 # Tracé sur l'axe Boite
                 ln_gr, = self.ax_gear.plot(
                     xs, ys_gear, lw=1.0, alpha=0.5, linestyle='--', drawstyle='steps-mid')
