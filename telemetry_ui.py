@@ -2,12 +2,27 @@ import sys
 import time
 import math
 import irsdk
+import numpy as np
 import pandas as pd
 
 from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QFileDialog, QRadioButton, QScrollArea, QFrame
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavToolbar
+
+
+class ClickableLabel(QLabel):
+    """QLabel émettant un signal clicked(index) au clic souris."""
+    clicked = pyqtSignal(int)
+
+    def __init__(self, index, text="", parent=None):
+        super().__init__(text, parent)
+        self._index = index
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, ev):
+        self.clicked.emit(self._index)
+        super().mousePressEvent(ev)
 
 
 # ==============================================================================
@@ -135,6 +150,7 @@ class TelemetryWorker(QThread):
                                                       weekend_info.get('TrackName', 'Circuit'))
 
                     driver_info = self.ir['DriverInfo']
+                    my_idx = 0
                     if isinstance(driver_info, dict):
                         my_idx = driver_info.get('DriverCarIdx', 0)
                         drivers = driver_info.get('Drivers', [])
@@ -147,6 +163,7 @@ class TelemetryWorker(QThread):
                     print(f"⚠️ Erreur parsing dictionnaire : {e}")
                     track_name = "Circuit"
                     car_name = "Voiture"
+                    my_idx = 0
 
                 if is_on_track and current_lap > 0:
                     if is_in_pit:
@@ -175,6 +192,19 @@ class TelemetryWorker(QThread):
                     except Exception:
                         steer = 0.0
 
+                    # Lecture des coordonnées GPS classiques (Lat/Lon)
+                    lat = self._safe_ir_read("Lat", 0.0)
+                    lon = self._safe_ir_read("Lon", 0.0)
+
+                    # (CarIdxPos* removed) — on ne lit plus de positions absolues
+                    # Vitesses monde (m/s) — utiles pour reconstruire la trajectoire
+                    velx = self._safe_ir_read("VelocityX", None)
+                    if velx is None:
+                        velx = self._safe_ir_read("VelocityX_ST", 0.0)
+                    vely = self._safe_ir_read("VelocityY", None)
+                    if vely is None:
+                        vely = self._safe_ir_read("VelocityY_ST", 0.0)
+
                     self.telemetry_signal.emit({
                         "lap_num": current_lap,
                         "lap_time": lap_time,
@@ -197,6 +227,10 @@ class TelemetryWorker(QThread):
                         "lap_dist": lap_dist,
                         "rpm": rpm,
                         "steer": steer,
+                        "lat": lat,
+                        "lon": lon,
+                        "velx": velx,
+                        "vely": vely,
                         "in_outlap": self.in_outlap,
                         "is_in_pit": is_in_pit,
                         "is_in_garage": is_in_garage,
@@ -243,6 +277,22 @@ class MainWindow(QMainWindow):
         self.dist_data = []
         self.rpm_data = []
         self.steer_data = []
+        self.lat_data = []
+        self.lon_data = []
+        self.posx_data = []
+        self.posy_data = []
+        self.velx_data = []
+        self.vely_data = []
+
+        # Intégration des vitesses -> positions (état pour intégration incrémentale)
+        self._last_velx = None
+        self._last_vely = None
+        self._last_time_for_pos = None
+        self._last_posx = 0.0
+        self._last_posy = 0.0
+        # Flag pour activer/désactiver l'utilisation des coordonnées monde
+        # Désactivé par défaut
+        self.use_world_coords = False
         self.x_axis_mode = "time"
         self.current_lap_buffer = []
 
@@ -257,6 +307,13 @@ class MainWindow(QMainWindow):
         self._plot_dirty = False
         self._fill_throttle = None
         self._fill_brake = None
+        # État du curseur vertical et du zoom secteur
+        self._cursor_x = None
+        self._cursor_active = False
+        self._sector_bounds_x = None
+        self._zoomed_sector = None
+        self._map_overlay_lines = []
+        self._ref_track = None
         # Palette de couleurs cyclique pour les tours compar\u00e9s (style Garage 61)
         self._lap_palette = ["#e8112d", "#1565c0", "#2e7d32",
                              "#f9a825", "#6a1b9a", "#00838f", "#d84315"]
@@ -360,6 +417,21 @@ class MainWindow(QMainWindow):
         ctrl_col.addWidget(self.sector_label)
         ctrl_col.addStretch()
         ctrl_layout.addLayout(ctrl_col)
+
+        # --- MINI-CARTE DU CIRCUIT (trajectoire) ---
+        self.live_col = '#e8112d'
+        self.map_figure = plt.figure(facecolor='#ffffff')
+        self.ax_map = self.map_figure.add_axes([0, 0, 1, 1])
+        self.ax_map.set_aspect('equal', adjustable='datalim')
+        self.ax_map.axis('off')
+        self.map_canvas = FigureCanvas(self.map_figure)
+        self.map_canvas.setFixedSize(260, 200)
+        self.map_line, = self.ax_map.plot(
+            [], [], color=self.live_col, lw=1.6)
+        self.map_dot, = self.ax_map.plot(
+            [], [], 'o', color='#111', markersize=7, zorder=5)
+        ctrl_layout.addWidget(self.map_canvas)
+
         layout.addLayout(ctrl_layout)
 
         # --- THÈME CLAIR (style Garage 61) ---
@@ -419,16 +491,18 @@ class MainWindow(QMainWindow):
         # stretch=1 : le scroll area prend tout l'espace vertical restant
         layout.addWidget(self.scroll_area, 1)
 
-        # --- BARRE DE SECTEURS (bas, style Garage 61) ---
+        # --- BARRE DE SECTEURS (bas, style Garage 61, cliquable) ---
         self.sector_bar_labels = []
         sector_bar = QHBoxLayout()
         sector_bar.setSpacing(3)
-        for name in ("S1", "S2", "S3"):
-            seg = QLabel(name)
+        for i, name in enumerate(("S1", "S2", "S3")):
+            seg = ClickableLabel(i, name)
             seg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            seg.setToolTip("Cliquer pour zoomer sur ce secteur")
             seg.setStyleSheet(
                 "font-size:13px; font-weight:bold; color:#555;"
                 " background:#e6e6ea; padding:6px; border-radius:4px;")
+            seg.clicked.connect(self._on_sector_click)
             self.sector_bar_labels.append(seg)
             sector_bar.addWidget(seg)
         layout.addLayout(sector_bar)
@@ -481,6 +555,23 @@ class MainWindow(QMainWindow):
             ax.grid(True)
             ax.margins(x=0)
 
+        # --- CURSEUR VERTICAL DÉPLAÇABLE (style Garage 61) ---
+        self.cursor_lines = []
+        self.cursor_texts = []
+        for ax in self.all_axes:
+            cl = ax.axvline(0, color='#222', lw=0.9, alpha=0.0, zorder=4)
+            self.cursor_lines.append(cl)
+            txt = ax.text(
+                0, 0.92, "", transform=ax.get_xaxis_transform(),
+                ha='center', va='top', fontsize=9, fontweight='bold',
+                color='#ffffff', zorder=6,
+                bbox=dict(boxstyle='round,pad=0.25', fc=self.live_col,
+                          ec='none', alpha=0.92))
+            txt.set_visible(False)
+            self.cursor_texts.append(txt)
+        self.canvas.mpl_connect('motion_notify_event', self._on_mouse_move)
+        self.canvas.mpl_connect('axes_leave_event', self._on_mouse_leave)
+
         # Timer de rendu découplé : matplotlib ne redessine qu'à ~15 fps
         self._plot_timer = QTimer(self)
         self._plot_timer.setInterval(66)
@@ -514,6 +605,8 @@ class MainWindow(QMainWindow):
         lap_dist = data.get("lap_dist", 0.0)
         rpm = data.get("rpm", 0.0)
         steer = data.get("steer", 0.0)
+        lat = data.get("lat", 0.0)
+        lon = data.get("lon", 0.0)
         self.current_track = data["track_name"]
         self.current_car = data["car_name"]
         self.label_info.setText(
@@ -545,10 +638,33 @@ class MainWindow(QMainWindow):
             self.dist_data.clear()
             self.rpm_data.clear()
             self.steer_data.clear()
+            self.lat_data.clear()
+            self.lon_data.clear()
+            self.posx_data.clear()
+            self.posy_data.clear()
             self.current_lap_buffer.clear()
             self.last_processed_lap = lap_num
 
-        status_text = "OUTLAP" if in_outlap else "TRACK"
+            self.posx_data.clear()
+            self.posy_data.clear()
+            self.velx_data.clear()
+            self.vely_data.clear()
+            self._last_velx = None
+            self._last_vely = None
+            self._last_time_for_pos = None
+            self._last_posx = 0.0
+            self._last_posy = 0.0
+            self.current_lap_buffer.clear()
+        # Déterminer un libellé d'état pour l'affichage
+        if in_outlap:
+            status_text = "Outlap"
+        elif is_in_garage:
+            status_text = "Garage"
+        elif is_in_pit:
+            status_text = "Pit"
+        else:
+            status_text = "Sur piste"
+
         self.label_speed.setText(
             f"Lap {lap_num} [{status_text}] | Temps : {lap_time:.2f}s | Vitesse : {speed:.1f} km/h | Gaz : {throttle:.0f}% | Frein : {brake:.0f}% | Vitesse : {gear_str}")
 
@@ -614,9 +730,40 @@ class MainWindow(QMainWindow):
             self.dist_data.append(lap_dist)
             self.rpm_data.append(rpm)
             self.steer_data.append(steer)
+            self.lat_data.append(lat)
+            self.lon_data.append(lon)
+            # Vitesses
+            velx = data.get('velx', 0.0)
+            vely = data.get('vely', 0.0)
+            self.velx_data.append(velx)
+            self.vely_data.append(vely)
+
+            # Calcul incrémental de la position par intégration trapézoïdale
+            if self._last_time_for_pos is None:
+                cur_posx = 0.0
+                cur_posy = 0.0
+            else:
+                dt = max(0.0, lap_time - self._last_time_for_pos)
+                prev_vx = float(
+                    self._last_velx) if self._last_velx is not None else float(velx or 0.0)
+                prev_vy = float(
+                    self._last_vely) if self._last_vely is not None else float(vely or 0.0)
+                cur_posx = self._last_posx + 0.5 * \
+                    (prev_vx + float(velx or 0.0)) * dt
+                cur_posy = self._last_posy + 0.5 * \
+                    (prev_vy + float(vely or 0.0)) * dt
+            # update integration state
+            self._last_posx = float(cur_posx)
+            self._last_posy = float(cur_posy)
+            self._last_velx = float(velx or 0.0)
+            self._last_vely = float(vely or 0.0)
+            self._last_time_for_pos = lap_time
+
+            self.posx_data.append(cur_posx)
+            self.posy_data.append(cur_posy)
 
             self.current_lap_buffer.append(
-                (lap_time, speed, throttle, brake, gear, lap_dist, rpm, steer))
+                (lap_time, speed, throttle, brake, gear, lap_dist, rpm, steer, lat, lon, cur_posx, cur_posy, 0.0))
 
             x_data = self.get_x_data()
             self.line_speed.set_visible(True)
@@ -636,6 +783,16 @@ class MainWindow(QMainWindow):
 
             self.line_steer.set_visible(True)
             self.line_steer.set_data(x_data, self.steer_data)
+
+            # Trajectoire live sur la mini-carte (GPS ou reconstruite)
+            if not self.saved_view_active and len(self.time_data) > 3:
+                xy = self._series_track_xy(self._get_reference_series())
+                if xy is not None:
+                    self.map_line.set_data(xy[0], xy[1])
+                    self.ax_map.relim()
+                    self.ax_map.autoscale_view()
+                    self.ax_map.margins(0.05)
+                    self._update_map_reference()
         else:
             if in_outlap or is_in_pit or is_in_garage:
                 self.line_speed.set_visible(False)
@@ -647,7 +804,9 @@ class MainWindow(QMainWindow):
 
         if not self.saved_view_active and self.time_data:
             live_x = self.get_x_data()
-            self.ax_bottom.set_xlim(0, max(10, live_x[-1] + 1))
+            if self._zoomed_sector is None:
+                self.ax_bottom.set_xlim(0, max(10, live_x[-1] + 1))
+            self._sector_bounds_x = self._compute_sector_bounds_live()
 
         self._plot_dirty = True
 
@@ -675,6 +834,7 @@ class MainWindow(QMainWindow):
                     alpha=0.15, color=self.live_col, linewidth=0)
 
             self.canvas.draw_idle()
+            self.map_canvas.draw_idle()
             self._plot_dirty = False
 
     def add_lap_to_list_widget(self, lap_num, total_time, origin="Session"):
@@ -705,6 +865,15 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
         self.saved_lap_lines.clear()
+
+        # Nettoyage des trajectoires de la carte + reset du zoom secteur
+        for ln in self._map_overlay_lines:
+            try:
+                ln.remove()
+            except Exception:
+                pass
+        self._map_overlay_lines = []
+        self._zoomed_sector = None
 
         laps_to_show = []
         for i in range(self.lap_list.count()):
@@ -765,6 +934,13 @@ class MainWindow(QMainWindow):
                 self.saved_lap_lines[f"{origin}_{k}"] = [
                     ln_sp, ln_th, ln_bk, ln_gr, ln_rp, ln_st]
 
+                # Trajectoire sur la mini-carte (GPS ou reconstruite)
+                xy = self._series_track_xy(self._series_from_pts(pts))
+                if xy is not None:
+                    ml, = self.ax_map.plot(
+                        xy[0], xy[1], lw=1.4, alpha=0.9, color=color)
+                    self._map_overlay_lines.append(ml)
+
                 sectors = self._compute_sectors(pts)
                 if sectors is not None:
                     sector_rows.append((label_name, color, sectors))
@@ -783,6 +959,20 @@ class MainWindow(QMainWindow):
             self.ax_speed.legend(loc='upper right', fontsize=9, ncol=4)
         except Exception:
             pass
+
+        # Carte : masquer la trajectoire live quand on compare des tours sauvés
+        self.map_line.set_visible(not self.saved_view_active)
+        if self._map_overlay_lines:
+            self.ax_map.relim()
+            self.ax_map.autoscale_view()
+            self.ax_map.margins(0.05)
+
+        # Tracé de référence pour le point de position sur la carte
+        self._update_map_reference()
+
+        # Série de référence (1er tour coché) pour le curseur et les secteurs
+        self._sector_bounds_x = self._compute_sector_bounds(
+            self._get_reference_series())
 
         self._update_sector_display(sector_rows)
         self._plot_dirty = True
@@ -851,6 +1041,226 @@ class MainWindow(QMainWindow):
                 f"font-size:13px; font-weight:bold; color:#fff;"
                 f" background:{holder[1]}; padding:6px; border-radius:4px;")
 
+    # ------------------------------------------------------------------
+    #  Série de référence, curseur interactif et zoom secteur
+    # ------------------------------------------------------------------
+    def _series_from_pts(self, pts):
+        """Construit un dict de séries (numpy) à partir d'une liste de points."""
+        arr = np.asarray(pts, dtype=float)
+        m = arr.shape[1]
+        xcol = 5 if (self.x_axis_mode == "distance" and m >= 6) else 0
+        n = arr.shape[0]
+        zeros = np.zeros(n)
+        return {
+            'x': arr[:, xcol],
+            'time': arr[:, 0],
+            'speed': arr[:, 1] if m > 1 else zeros,
+            'throttle': arr[:, 2] if m > 2 else zeros,
+            'brake': arr[:, 3] if m > 3 else zeros,
+            'gear': arr[:, 4] if m > 4 else zeros,
+            'dist': arr[:, 5] if m >= 6 else None,
+            'rpm': arr[:, 6] if m >= 7 else zeros,
+            'steer': arr[:, 7] if m >= 8 else zeros,
+            'lat': arr[:, 8] if m >= 9 else None,
+            'lon': arr[:, 9] if m >= 10 else None,
+            'posx': arr[:, 10] if m >= 11 else None,
+            'posy': arr[:, 11] if m >= 12 else None,
+            'posz': arr[:, 12] if m >= 13 else None,
+        }
+
+    def _get_reference_series(self):
+        """Retourne la série de référence : 1er tour coché, sinon le tour live."""
+        if self.saved_view_active:
+            for i in range(self.lap_list.count()):
+                it = self.lap_list.item(i)
+                if it.checkState() == Qt.CheckState.Checked:
+                    k = it.data(256)
+                    origin = it.data(257)
+                    pts = (self.live_saved_laps.get(k, []) if origin == "Session"
+                           else self.imported_laps.get(k, []))
+                    if pts:
+                        return self._series_from_pts(pts)
+            return None
+        if not self.time_data:
+            return None
+        xs = self.get_x_data()
+        return {
+            'x': np.asarray(xs, dtype=float),
+            'time': np.asarray(self.time_data, dtype=float),
+            'speed': np.asarray(self.speed_data, dtype=float),
+            'throttle': np.asarray(self.throttle_data, dtype=float),
+            'brake': np.asarray(self.brake_data, dtype=float),
+            'gear': np.asarray(self.gear_data, dtype=float),
+            'dist': np.asarray(self.dist_data, dtype=float) if self.dist_data else None,
+            'rpm': np.asarray(self.rpm_data, dtype=float),
+            'steer': np.asarray(self.steer_data, dtype=float),
+            'lat': np.asarray(self.lat_data, dtype=float) if self.lat_data else None,
+            'lon': np.asarray(self.lon_data, dtype=float) if self.lon_data else None,
+            'posx': np.asarray(self.posx_data, dtype=float) if self.posx_data else None,
+            'posy': np.asarray(self.posy_data, dtype=float) if self.posy_data else None,
+        }
+
+    # ------------------------------------------------------------------
+    #  Reconstruction de la trajectoire (carte du circuit)
+    # ------------------------------------------------------------------
+    def _reconstruct_xy(self, v_kmh, steer_deg, t):
+        """Reconstruit un tracé (x, y) par intégration vitesse + angle volant.
+
+        Le cap est normalisé pour que le tour se referme (~360°), ce qui
+        donne une forme de circuit reconnaissable même sans coordonnées GPS.
+        """
+        v = np.asarray(v_kmh, dtype=float) / 3.6  # m/s
+        steer = np.radians(np.asarray(steer_deg, dtype=float))
+        t = np.asarray(t, dtype=float)
+        n = len(t)
+        if n < 3:
+            return None
+        dt = np.diff(t, prepend=t[0])
+        dt[dt < 0] = 0.0
+        weighted = steer * dt
+        total = float(np.sum(weighted))
+        if abs(total) < 1e-6:
+            return None
+        gain = (2.0 * np.pi) / total
+        heading = np.cumsum(weighted * gain)
+        x = np.cumsum(v * np.cos(heading) * dt)
+        y = np.cumsum(v * np.sin(heading) * dt)
+        return x, y
+
+    def _series_track_xy(self, s):
+        """Retourne (xs, ys) pour la mini-carte à partir d'une série.
+
+        Utilise Lat/Lon si elles varient suffisamment, sinon reconstruit le
+        tracé à partir de la vitesse et de l'angle volant.
+        """
+        if s is None:
+            return None
+        # Coordonnées monde (posx/posy) : si présentes, seront détectées
+        # plus bas et utilisées en priorité avant Lat/Lon.
+
+        # Si des positions reconstruits (par intégration des vitesses) sont
+        # présentes dans la série, les utiliser (priorité avant Lat/Lon).
+        px = s.get('posx')
+        py = s.get('posy')
+        if px is not None and py is not None and len(px) > 2:
+            px = np.asarray(px, dtype=float)
+            py = np.asarray(py, dtype=float)
+            if (np.nanmax(px) - np.nanmin(px) > 1e-6 or
+                    np.nanmax(py) - np.nanmin(py) > 1e-6):
+                return px, py
+
+        lat = s.get('lat')
+        lon = s.get('lon')
+        if lat is not None and lon is not None and len(lat) > 2:
+            lat = np.asarray(lat, dtype=float)
+            lon = np.asarray(lon, dtype=float)
+            if (np.nanmax(lon) - np.nanmin(lon) > 1e-5 or
+                    np.nanmax(lat) - np.nanmin(lat) > 1e-5):
+                return lon, lat
+        t = s.get('time')
+        if t is None:
+            t = s.get('x')
+        return self._reconstruct_xy(s.get('speed'), s.get('steer'), t)
+
+    def _update_map_reference(self):
+        """Met à jour le tracé de référence pour le point de curseur sur la carte."""
+        ref = self._get_reference_series()
+        xy = self._series_track_xy(ref)
+        if xy is None or ref is None:
+            self._ref_track = None
+        else:
+            self._ref_track = (np.asarray(ref['x'], dtype=float), xy[0], xy[1])
+
+    def _compute_sector_bounds(self, ref):
+        """Calcule les bornes X (début, fin) de chaque secteur depuis la référence."""
+        if ref is None or ref.get('dist') is None:
+            return None
+        dist = ref['dist']
+        x = ref['x']
+        if len(dist) < 2 or dist[-1] <= 0:
+            return None
+        total = dist[-1]
+        x1 = float(np.interp(total / 3.0, dist, x))
+        x2 = float(np.interp(2.0 * total / 3.0, dist, x))
+        return [(float(x[0]), x1), (x1, x2), (x2, float(x[-1]))]
+
+    def _compute_sector_bounds_live(self):
+        return self._compute_sector_bounds(self._get_reference_series())
+
+    def _on_mouse_move(self, event):
+        """Déplace le curseur vertical et met à jour les bulles de valeurs."""
+        if event.inaxes not in self.all_axes or event.xdata is None:
+            return
+        self._cursor_x = event.xdata
+        self._cursor_active = True
+        self._update_cursor()
+        self._plot_dirty = True
+
+    def _on_mouse_leave(self, event):
+        # On conserve le curseur à sa dernière position (lecture figée)
+        pass
+
+    def _update_cursor(self):
+        """Positionne les lignes de curseur, les bulles et le point sur la carte."""
+        x = self._cursor_x
+        if x is None:
+            return
+        for cl in self.cursor_lines:
+            cl.set_xdata([x, x])
+            cl.set_alpha(0.55)
+
+        ref = self._get_reference_series()
+        channels = ['speed', 'throttle', 'brake', 'gear', 'rpm', 'steer']
+        if ref is not None and len(ref['x']) > 1:
+            xp = ref['x']
+            for i, ch in enumerate(channels):
+                v = float(np.interp(x, xp, ref[ch]))
+                if ch == 'speed':
+                    txt = f"{v:.0f} km/h"
+                elif ch in ('throttle', 'brake'):
+                    txt = f"{v:.0f} %"
+                elif ch == 'gear':
+                    g = int(round(v))
+                    txt = "N" if g == 0 else ("R" if g < 0 else str(g))
+                elif ch == 'rpm':
+                    txt = f"{v:.0f} rpm"
+                else:
+                    txt = f"{v:.0f}°"
+                bubble = self.cursor_texts[i]
+                bubble.set_text(txt)
+                bubble.set_position((x, 0.92))
+                bubble.set_visible(True)
+
+            # Point de position sur la mini-carte
+            if self._ref_track is not None:
+                tx, txs, tys = self._ref_track
+                if len(tx) > 1:
+                    dotx = float(np.interp(x, tx, txs))
+                    doty = float(np.interp(x, tx, tys))
+                    self.map_dot.set_data([dotx], [doty])
+                    self.map_dot.set_visible(True)
+        else:
+            for bubble in self.cursor_texts:
+                bubble.set_visible(False)
+
+    def _on_sector_click(self, s):
+        """Zoom sur le secteur cliqué (ou retour à la vue complète)."""
+        bounds = self._sector_bounds_x or self._compute_sector_bounds_live()
+        if not bounds or s >= len(bounds):
+            return
+        if self._zoomed_sector == s:
+            self._zoomed_sector = None
+            ref = self._get_reference_series()
+            xmax = float(
+                ref['x'][-1]) if (ref is not None and len(ref['x'])) else 10
+            self.ax_bottom.set_xlim(0, xmax + 1)
+        else:
+            self._zoomed_sector = s
+            x0, x1 = bounds[s]
+            pad = max((x1 - x0) * 0.02, 0.01)
+            self.ax_bottom.set_xlim(x0 - pad, x1 + pad)
+        self._plot_dirty = True
+
     def get_x_data(self):
         """Retourne les données X actives (temps ou distance) pour le tour en cours."""
         if self.x_axis_mode == "distance" and self.dist_data:
@@ -907,6 +1317,19 @@ class MainWindow(QMainWindow):
                         cols.append("RPM")
                     if n >= 8:
                         cols.append("Volant (deg)")
+                    if n >= 9:
+                        cols.append("Lat")
+                    if n >= 10:
+                        cols.append("Lon")
+                    # Ajouter les colonnes PosX/PosY/PosZ uniquement si
+                    # l'option est activée (garder le support inactif par défaut)
+                    if self.use_world_coords:
+                        if n >= 11:
+                            cols.append("PosX")
+                        if n >= 12:
+                            cols.append("PosY")
+                        if n >= 13:
+                            cols.append("PosZ")
                     df = pd.DataFrame(points, columns=cols[:n])
                     df.to_excel(
                         writer, sheet_name=f"Tour_{lap_num}", index=False)
@@ -928,7 +1351,22 @@ class MainWindow(QMainWindow):
 
                     df = excel_file.parse(sheet_name)
 
-                    if "Volant (deg)" in df.columns:
+                    if "PosX" in df.columns and "PosY" in df.columns:
+                        points = list(zip(
+                            df["Temps (s)"], df["Vitesse (km/h)"], df["Throttle (%)"],
+                            df["Brake (%)"], df["Gear"], df.get(
+                                "Distance (m)", [0]*len(df)),
+                            df.get("RPM", [0]*len(df)
+                                   ), df.get("Volant (deg)", [0]*len(df)),
+                            df.get("Lat", [0]*len(df)
+                                   ), df.get("Lon", [0]*len(df)),
+                            df["PosX"], df["PosY"], df.get("PosZ", [0]*len(df))))
+                    elif "Lon" in df.columns:
+                        points = list(zip(
+                            df["Temps (s)"], df["Vitesse (km/h)"], df["Throttle (%)"],
+                            df["Brake (%)"], df["Gear"], df["Distance (m)"],
+                            df["RPM"], df["Volant (deg)"], df["Lat"], df["Lon"]))
+                    elif "Volant (deg)" in df.columns:
                         points = list(zip(
                             df["Temps (s)"], df["Vitesse (km/h)"], df["Throttle (%)"],
                             df["Brake (%)"], df["Gear"], df["Distance (m)"],
